@@ -1,57 +1,50 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import resend
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# SMTP Configuration
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USER)
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "NotesApp")
+# Resend Configuration
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+RESEND_FROM_NAME = os.getenv("RESEND_FROM_NAME", "NotesApp")
+
+# Initialize Resend
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 def send_email(to_email: str, subject: str, html_body: str, text_body: str = None):
     """
-    Send an email via SMTP
+    Send an email via Resend API
     
     Args:
         to_email: Recipient email address
         subject: Email subject
         html_body: HTML content of the email
-        text_body: Plain text version (optional, will use html_body if not provided)
+        text_body: Plain text version (optional)
     
     Returns:
         bool: True if email sent successfully, False otherwise
     """
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print("⚠️  SMTP credentials not configured. Email not sent.")
+    if not RESEND_API_KEY:
+        print("⚠️  Resend API key not configured. Email not sent.")
         return False
     
     try:
-        # Create message
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-        msg['To'] = to_email
+        # Prepare email data
+        email_data = {
+            "from": f"{RESEND_FROM_NAME} <{RESEND_FROM_EMAIL}>",
+            "to": to_email,
+            "subject": subject,
+            "html": html_body,
+        }
         
-        # Add plain text version
+        # Add text version if provided
         if text_body:
-            part1 = MIMEText(text_body, 'plain')
-            msg.attach(part1)
+            email_data["text"] = text_body
         
-        # Add HTML version
-        part2 = MIMEText(html_body, 'html')
-        msg.attach(part2)
-        
-        # Connect to SMTP server and send
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
+        # Send email via Resend
+        response = resend.Emails.send(email_data)
         
         print(f"✅ Email sent successfully to {to_email}")
         return True
@@ -186,7 +179,9 @@ def send_share_email(to_email: str, sender_name: str, note_title: str, is_new_us
     subject = f"{sender_name} shared a note with you: {note_title}"
     
     action_text = "View Note" if not is_new_user else "Sign Up to View"
-    action_url = "http://localhost:5173" # Base URL
+    # Get frontend URL from environment, fallback to localhost for development
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    action_url = frontend_url
     
     # HTML version
     html_body = f"""

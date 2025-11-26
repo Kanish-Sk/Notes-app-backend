@@ -526,6 +526,39 @@ async def reset_password(request_data: ResetPasswordRequest):
     
     return {"message": "Password successfully reset"}
 
+# ==================== User Search Routes ====================
+
+@app.get("/api/users/search")
+async def search_users(query: str, current_user: UserInDB = Depends(get_current_active_user)):
+    """Search for users by email or name (for sharing notes/folders)"""
+    db = get_database()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    if not query or len(query) < 2:
+        return []
+    
+    # Search by email or full_name (case-insensitive)
+    search_regex = {"$regex": query, "$options": "i"}
+    users = await db.users.find({
+        "$or": [
+            {"email": search_regex},
+            {"full_name": search_regex}
+        ],
+        "is_active": True
+    }).limit(10).to_list(10)
+    
+    # Return user info (excluding sensitive data)
+    return [
+        {
+            "id": str(user["_id"]),
+            "email": user.get("email"),
+            "full_name": user.get("full_name"),
+            "picture": user.get("picture")
+        }
+        for user in users
+    ]
+
 # ==================== MongoDB Connection Routes ====================
 
 @app.post("/api/verify-mongodb", response_model=MongoDBConnectionResponse)
