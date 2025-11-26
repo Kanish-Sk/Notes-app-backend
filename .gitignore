@@ -33,3 +33,7 @@ Thumbs.db
 # Database
 *.db
 *.sqlite
+
+# Gmail API
+credentials.json
+token.json

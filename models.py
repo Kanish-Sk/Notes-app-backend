@@ -137,6 +137,7 @@ class User(BaseModel):
     is_active: bool = True
     mongodb_connection_string: Optional[str] = None  # User's own MongoDB cluster
     has_database: bool = False  # Whether user has configured their database
+    notes_count: int = 0  # Track number of notes created by user
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class UserInDB(User):
@@ -195,3 +196,12 @@ class MongoDBConnectionResponse(BaseModel):
     success: bool
     message: str
 
+class TestLLMConnectionRequest(BaseModel):
+    provider: str
+    api_key: str
+    model: str
+
+class TestLLMConnectionResponse(BaseModel):
+    success: bool
+    message: str
+    error_type: Optional[str] = None

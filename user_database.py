@@ -52,6 +52,9 @@ async def verify_mongodb_connection(connection_string: str) -> tuple[bool, str]:
     
     except Exception as e:
         error_msg = str(e)
+        print(f"❌ MongoDB Connection Error: {error_msg}")  # Debug logging
+        print(f"   Connection string starts with: {connection_string[:20]}...")  # Show beginning of connection string
+        
         if "authentication" in error_msg.lower():
             return False, "Authentication failed. Please check your credentials."
         elif "timeout" in error_msg.lower():

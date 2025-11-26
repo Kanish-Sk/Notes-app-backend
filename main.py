@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import httpx
 
 from database import connect_to_mongo, close_mongo_connection, get_database
+from pymongo import ReturnDocument
 from models import (
     NoteCreate, NoteUpdate, NoteInDB, 
     FolderCreate, FolderUpdate, FolderInDB,
@@ -17,7 +18,8 @@ from models import (
     LLMProvider, LLMSettings, LLMSettingsInDB,
     User, UserInDB, UserCreate, UserLogin, Token, RefreshTokenData, GoogleAuthRequest,
     ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, ShareNoteRequest,
-    MongoDBConnectionRequest, MongoDBConnectionResponse
+    MongoDBConnectionRequest, MongoDBConnectionResponse,
+    TestLLMConnectionRequest, TestLLMConnectionResponse
 )
 from auth import (
     get_password_hash, 
@@ -31,7 +33,7 @@ from auth import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     REFRESH_TOKEN_EXPIRE_DAYS
 )
-from email_utils import send_share_email
+from email_utils import send_share_notification_email
 
 load_dotenv()
 
@@ -74,6 +76,33 @@ app.add_middleware(
 async def root():
     return {"message": "Notion-like Notes API", "version": "1.0.0"}
 
+# ==================== Database Helper ====================
+
+async def get_user_data_db(current_user: UserInDB):
+    """
+    Get the appropriate database for storing user data (notes, folders, chats).
+    Returns user's personal database if configured, otherwise returns main database.
+    """
+    # If user has configured their own database, use it
+    if current_user.has_database and current_user.mongodb_connection_string:
+        from user_database import get_user_database
+        try:
+            user_db = await get_user_database(
+                current_user.id,
+                current_user.mongodb_connection_string,
+                database_name="user_data"
+            )
+            return user_db
+        except Exception as e:
+            print(f"⚠️  Failed to connect to user's database: {e}")
+            print(f"   Falling back to main database")
+            # Fallback to main database if user's DB fails
+            return get_database()
+    else:
+        # Use main database
+        return get_database()
+
+
 @app.get("/api/stats")
 async def get_statistics():
     """Get app statistics - no auth required"""
@@ -85,8 +114,12 @@ async def get_statistics():
         # Count total users
         users_count = await db.users.count_documents({})
         
-        # Count total notes
-        notes_count = await db.notes.count_documents({})
+        # Sum notes_count from all users
+        pipeline = [
+            {"$group": {"_id": None, "total_notes": {"$sum": "$notes_count"}}}
+        ]
+        result = await db.users.aggregate(pipeline).to_list(length=1)
+        notes_count = result[0]["total_notes"] if result else 0
         
         return {
             "users": users_count,
@@ -219,7 +252,9 @@ async def login(user_data: UserLogin):
             "id": user.id,
             "email": user.email,
             "full_name": user.full_name,
-            "picture": user.picture
+            "picture": user.picture,
+            "has_database": user.has_database,
+            "mongodb_connection_string": user.mongodb_connection_string
         }
     )
 
@@ -241,7 +276,6 @@ async def google_auth(auth_data: GoogleAuthRequest):
                 )
             
             # For simplicity, we'll verify by getting user info directly
-            # In production, you should properly verify the JWT signature
             user_info_response = await client.get(
                 f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}"
             )
@@ -277,6 +311,8 @@ async def google_auth(auth_data: GoogleAuthRequest):
                 "provider": "google",
                 "refresh_tokens": [],
                 "is_active": True,
+                "has_database": False,
+                "mongodb_connection_string": None,
                 "created_at": datetime.utcnow()
             }
             
@@ -284,21 +320,20 @@ async def google_auth(auth_data: GoogleAuthRequest):
             created_user = await db.users.find_one({"_id": result.inserted_id})
             user = UserInDB(**{**created_user, "_id": str(created_user["_id"])})
         
-        # Create JWT access token
+        # Create tokens
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user.email}, 
+            data={"sub": user.email},
             expires_delta=access_token_expires
         )
         
-        # Create refresh token
         refresh_token_expires = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
         refresh_token = create_refresh_token(
             data={"sub": user.email},
             expires_delta=refresh_token_expires
         )
         
-        # Store refresh token in database
+        # Store refresh token
         await db.users.update_one(
             {"_id": ObjectId(user.id)},
             {"$push": {"refresh_tokens": refresh_token}}
@@ -311,7 +346,9 @@ async def google_auth(auth_data: GoogleAuthRequest):
                 "id": user.id,
                 "email": user.email,
                 "full_name": user.full_name,
-                "picture": user.picture
+                "picture": user.picture,
+                "has_database": user.has_database,
+                "mongodb_connection_string": user.mongodb_connection_string
             }
         )
     except HTTPException:
@@ -600,6 +637,23 @@ async def update_user_database(
         }}
     )
     
+    # Fetch and return updated user
+    updated_user = await db.users.find_one({"_id": ObjectId(current_user.id)})
+    if updated_user:
+        # Don't send encrypted connection string to frontend
+        user_response = {
+            "id": str(updated_user["_id"]),
+            "email": updated_user.get("email"),
+            "full_name": updated_user.get("full_name"),
+            "picture": updated_user.get("picture"),
+            "has_database": updated_user.get("has_database", False),
+            "provider": updated_user.get("provider", "email")
+        }
+        return {
+            "message": "Database connection updated successfully",
+            "user": user_response
+        }
+    
     return {"message": "Database connection updated successfully", "has_database": True}
 
 # ==================== Access Control Helpers ====================
@@ -639,7 +693,7 @@ def can_edit_folder(folder: dict, user_id: str) -> bool:
 @app.get("/api/notes", response_model=List[NoteInDB])
 async def get_all_notes(current_user: UserInDB = Depends(get_current_active_user)):
     """Get all notes (owned and shared)"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is not None:
         # Get owned notes and notes shared with user
         notes = await db.notes.find({
@@ -656,7 +710,7 @@ async def get_all_notes(current_user: UserInDB = Depends(get_current_active_user
 @app.get("/api/notes/{note_id}", response_model=NoteInDB)
 async def get_note(note_id: str, current_user: UserInDB = Depends(get_current_active_user)):
     """Get a specific note by ID (if owned or shared)"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is not None:
         try:
             note = await db.notes.find_one({"_id": ObjectId(note_id)})
@@ -680,9 +734,8 @@ async def get_note(note_id: str, current_user: UserInDB = Depends(get_current_ac
 
 @app.post("/api/folders", response_model=FolderInDB)
 async def create_folder(folder: FolderCreate, current_user: UserInDB = Depends(get_current_active_user)):
-    db = get_database()
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
+    """Create a new folder"""
+    db = await get_user_data_db(current_user)
     
     # Check for duplicate name in the same level
     existing_duplicate = await db.folders.find_one({
@@ -717,9 +770,7 @@ async def create_folder(folder: FolderCreate, current_user: UserInDB = Depends(g
 
 @app.get("/api/folders", response_model=List[FolderInDB])
 async def list_folders(current_user: UserInDB = Depends(get_current_active_user)):
-    db = get_database()
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
+    db = await get_user_data_db(current_user)
     
     # Get owned folders and folders shared with user
     folders = await db.folders.find({
@@ -732,9 +783,7 @@ async def list_folders(current_user: UserInDB = Depends(get_current_active_user)
 
 @app.put("/api/folders/{folder_id}", response_model=FolderInDB)
 async def update_folder(folder_id: str, folder: FolderUpdate, current_user: UserInDB = Depends(get_current_active_user)):
-    db = get_database()
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
+    db = await get_user_data_db(current_user)
     
     # Check ownership
     existing_folder = await db.folders.find_one({"_id": ObjectId(folder_id)})
@@ -809,9 +858,7 @@ async def delete_folder(
     destination_folder_id: Optional[str] = None,
     current_user: UserInDB = Depends(get_current_active_user)
 ):
-    db = get_database()
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
+    db = await get_user_data_db(current_user)
     
     # Check ownership
     existing_folder = await db.folders.find_one({"_id": ObjectId(folder_id)})
@@ -873,7 +920,7 @@ async def share_folder(
     current_user: UserInDB = Depends(get_current_active_user)
 ):
     """Share a folder with another user by email"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     
@@ -885,14 +932,18 @@ async def share_folder(
     # Normalize email
     recipient_email = share_request.email.strip().lower()
     
-    # Check if already shared with this user
-    shared_with = existing_folder.get("shared_with", [])
-    if recipient_email in shared_with:
-        raise HTTPException(status_code=400, detail="Folder already shared with this user")
-    
     # Check if recipient exists
     recipient = await get_user_by_email(recipient_email)
     is_new_user = recipient is None
+
+    # Check if already shared with this user
+    shared_with = existing_folder.get("shared_with", [])
+    if recipient_email in shared_with:
+        # If user exists, they already have access. If not, we allow resending the invite.
+        if not is_new_user:
+            raise HTTPException(status_code=400, detail="Folder already shared with this user")
+    
+
     
     # Update folder's shared_with list
     await db.folders.update_one(
@@ -902,11 +953,11 @@ async def share_folder(
     
     # Send email notification in background
     background_tasks.add_task(
-        send_share_email,
+        send_share_notification_email,
         to_email=recipient_email,
-        sender_name=current_user.full_name or current_user.email,
-        note_title=f"Folder: {existing_folder.get('name', 'Untitled')}",
-        is_new_user=is_new_user
+        shared_by_name=current_user.full_name or current_user.email,
+        item_type="folder",
+        item_title=existing_folder.get('name', 'Untitled')
     )
     
     return {
@@ -920,7 +971,8 @@ async def share_folder(
 @app.post("/api/notes", response_model=NoteInDB, status_code=status.HTTP_201_CREATED)
 async def create_note(note: NoteCreate, current_user: UserInDB = Depends(get_current_active_user)):
     """Create a new note"""
-    db = get_database()
+    # Use user's personal DB if configured, otherwise use main DB
+    db = await get_user_data_db(current_user)
     
     if db is not None:
         # Check for duplicate title in the same folder
@@ -949,6 +1001,15 @@ async def create_note(note: NoteCreate, current_user: UserInDB = Depends(get_cur
     if db is not None:
         result = await db.notes.insert_one(note_dict)
         created_note = await db.notes.find_one({"_id": result.inserted_id})
+        
+        # Increment user's note count in MAIN database (not user's DB)
+        main_db = get_database()
+        if main_db is not None:
+            await main_db.users.update_one(
+                {"_id": ObjectId(current_user.id)},
+                {"$inc": {"notes_count": 1}}
+            )
+        
         return NoteInDB(**{**created_note, "_id": str(created_note["_id"])})
     else:
         # Fallback to in-memory storage
@@ -961,7 +1022,7 @@ async def create_note(note: NoteCreate, current_user: UserInDB = Depends(get_cur
 @app.put("/api/notes/{note_id}", response_model=NoteInDB)
 async def update_note(note_id: str, note_update: NoteUpdate, current_user: UserInDB = Depends(get_current_active_user)):
     """Update a note (only owner can edit)"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     
     # Build update data - handle folder_id specially to allow None
     update_data = {}
@@ -1031,7 +1092,7 @@ async def update_note(note_id: str, note_update: NoteUpdate, current_user: UserI
 @app.delete("/api/notes/{note_id}")
 async def delete_note(note_id: str, current_user: UserInDB = Depends(get_current_active_user)):
     """Delete a note (only owner can delete)"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is not None:
         try:
             # First check if note exists and user has delete permission
@@ -1045,6 +1106,13 @@ async def delete_note(note_id: str, current_user: UserInDB = Depends(get_current
             
             result = await db.notes.delete_one({"_id": ObjectId(note_id)})
             if result.deleted_count:
+                # Decrement user's note count in MAIN database
+                main_db = get_database()
+                if main_db is not None:
+                    await main_db.users.update_one(
+                        {"_id": ObjectId(current_user.id)},
+                        {"$inc": {"notes_count": -1}}
+                    )
                 return {"message": "Note deleted successfully"}
         except HTTPException:
             raise
@@ -1066,7 +1134,7 @@ async def share_note(
     current_user: UserInDB = Depends(get_current_active_user)
 ):
     """Share a note with another user by email"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     
@@ -1081,14 +1149,18 @@ async def share_note(
     # Normalize email
     recipient_email = share_request.email.strip().lower()
     
-    # Check if already shared with this user
-    shared_with = note.get("shared_with", [])
-    if recipient_email in shared_with:
-        raise HTTPException(status_code=400, detail="Note already shared with this user")
-    
     # Check if recipient exists
     recipient = await get_user_by_email(recipient_email)
     is_new_user = recipient is None
+
+    # Check if already shared with this user
+    shared_with = note.get("shared_with", [])
+    if recipient_email in shared_with:
+        # If user exists, they already have access. If not, we allow resending the invite.
+        if not is_new_user:
+            raise HTTPException(status_code=400, detail="Note already shared with this user")
+    
+
     
     # Update note's shared_with list
     await db.notes.update_one(
@@ -1098,11 +1170,11 @@ async def share_note(
     
     # Send email notification in background
     background_tasks.add_task(
-        send_share_email,
+        send_share_notification_email,
         to_email=recipient_email,
-        sender_name=current_user.full_name or current_user.email,
-        note_title=note.get("title", "Untitled"),
-        is_new_user=is_new_user
+        shared_by_name=current_user.full_name or current_user.email,
+        item_type="note",
+        item_title=note.get('title', 'Untitled')
     )
     
     return {
@@ -1117,7 +1189,8 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
     """AI assistant endpoint using user-configured LLM provider from Settings"""
     import os
     
-    db = get_database()
+    # Use user's data database (which might be their personal MongoDB)
+    db = await get_user_data_db(current_user)
     if db is None:
         return AIResponse(
             message="Database not available. Please try again later.",
@@ -1127,7 +1200,16 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
     # Get user's LLM settings from database
     settings_doc = await db.llm_settings.find_one({"user_id": current_user.id})
     
+    # Debug logging
+    print(f"👤 User: {current_user.id}")
+    print(f"📂 Settings Doc Found: {settings_doc is not None}")
+    if settings_doc:
+        print(f"📋 Providers in DB: {len(settings_doc.get('providers', []))}")
+        print(f"📄 Full Settings: {settings_doc}")
+    
     if not settings_doc or not settings_doc.get("providers"):
+        reason = "No settings found" if not settings_doc else "Settings found but provider list is empty"
+        print(f"❌ AI Chat Error: {reason}")
         return AIResponse(
             message="AI assistant is not configured. Please add an LLM provider in Settings (⚙️ icon).",
             updated_content=None
@@ -1135,7 +1217,17 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
     
     # Get active providers
     providers = settings_doc.get("providers", [])
+    print(f"🔍 All providers: {len(providers)}")
+    for i, p in enumerate(providers):
+        print(f"  Provider {i}: {p.get('name')} - Active: {p.get('is_active')} - Model: {p.get('model')}")
+    
     active_providers = [p for p in providers if p.get("is_active", False)]
+    print(f"✅ Active providers: {len(active_providers)}")
+    
+    # Fallback: If providers exist but none are active, use the first one
+    if not active_providers and providers:
+        print("⚠️ No active providers found, falling back to first available provider")
+        active_providers = [providers[0]]
     
     if not active_providers:
         return AIResponse(
@@ -1155,7 +1247,13 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
     
     api_key = selected_provider.get("api_key")
     provider_type = selected_provider.get("provider", "openrouter")
-    model = selected_provider.get("model", "openai/gpt-4o-mini")
+    model = selected_provider.get("model")
+    
+    if not model:
+        return AIResponse(
+            message=f"Model not configured for '{selected_provider.get('name')}'. Please update it in Settings.",
+            updated_content=None
+        )
     
     if not api_key:
         return AIResponse(
@@ -1171,8 +1269,8 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
         # 4. Default prompt (fallback)
         
         use_global = selected_provider.get("use_global_prompt", False)
-        provider_system_prompt = selected_provider.get("system_prompt", "").strip()
-        global_system_prompt = settings_doc.get("system_prompt", "").strip()
+        provider_system_prompt = (selected_provider.get("system_prompt") or "").strip()
+        global_system_prompt = (settings_doc.get("system_prompt") or "").strip()
         
         if use_global and global_system_prompt:
             # Provider explicitly wants to use global prompt
@@ -1197,15 +1295,18 @@ Your task is to help users improve their notes. You can:
 When editing, provide the complete updated note content in markdown format.
 Be concise and helpful."""
             else:
-                system_prompt = """You are a helpful AI assistant for a note-taking app.
-Provide concise, helpful responses to user questions about their notes.
-Use markdown formatting when appropriate.
-Be friendly and constructive."""
+                system_prompt = DEFAULT_SYSTEM_PROMPT
         
         # Prepare messages
         messages = [
             {"role": "system", "content": system_prompt},
         ]
+        
+        print(f"🔧 AI Chat Debug:")
+        print(f"  Provider: {provider_type}")
+        print(f"  Model: {model}")
+        print(f"  System Prompt Length: {len(system_prompt)} chars")
+        print(f"  System Prompt Preview: {system_prompt[:100]}...")
         
         # Add context about the current note if there is content
         if request.current_content:
@@ -1220,28 +1321,112 @@ Be friendly and constructive."""
             "content": request.message
         })
         
-        # Make direct API call to OpenRouter using httpx
+        print(f"  User Message: {request.message}")
+        print(f"  Total Messages: {len(messages)}")
+        
+        # Determine API endpoint and headers based on provider
+        url = ""
+        headers = {}
+        payload = {}
+        
+        if provider_type == "openai":
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.7
+            }
+        elif provider_type == "anthropic":
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            }
+            # Anthropic expects system prompt separately
+            system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+            user_messages = [m for m in messages if m["role"] != "system"]
+            payload = {
+                "model": model,
+                "messages": user_messages,
+                "system": system_content,
+                "max_tokens": 4096
+            }
+        elif provider_type == "gemini":
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            headers = {"Content-Type": "application/json"}
+            # Gemini format conversion
+            gemini_contents = []
+            system_instruction = None
+            
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_instruction = {"parts": [{"text": msg["content"]}]}
+                else:
+                    role = "user" if msg["role"] == "user" else "model"
+                    gemini_contents.append({
+                        "role": role,
+                        "parts": [{"text": msg["content"]}]
+                    })
+            
+            payload = {
+                "contents": gemini_contents,
+                "generationConfig": {"temperature": 0.7}
+            }
+            if system_instruction:
+                payload["systemInstruction"] = system_instruction
+        else:
+            # Default to OpenRouter
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://mindflow.ai", 
+                "X-Title": "MindFlow AI"
+            }
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.7
+            }
+
+        # Make API call
+        print(f"  🌐 Calling API: {url}")
+        print(f"  📦 Payload model: {payload.get('model', 'N/A')}")
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": model,  # Use model from user settings
-                    "messages": messages,
-                    "temperature": 0.7,
-                    "max_tokens": 2000
-                },
-                timeout=30.0
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60.0
             )
             
+            print(f"  ✅ Response Status: {response.status_code}")
+            
             if response.status_code != 200:
-                raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+                error_detail = response.text
+                print(f"❌ LLM API Error ({provider_type}): {response.status_code} - {error_detail}")
+                raise Exception(f"Provider API error: {response.status_code}")
             
             result = response.json()
-            ai_message = result["choices"][0]["message"]["content"]
+            print(f"  📄 Response Keys: {list(result.keys())}")
+            
+            # Extract content based on provider
+            if provider_type == "anthropic":
+                ai_message = result["content"][0]["text"]
+            elif provider_type == "gemini":
+                ai_message = result["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                # OpenAI / OpenRouter format
+                ai_message = result["choices"][0]["message"]["content"]
+            
+            print(f"  💬 AI Message Length: {len(ai_message)} chars")
+            print(f"  💬 AI Message Preview: {ai_message[:200] if ai_message else 'EMPTY!'}")
         
         # If edit mode is enabled, prepare updated content
         updated_content = None
@@ -1267,21 +1452,21 @@ Be friendly and constructive."""
 # ==================== Chat History Routes ====================
 
 @app.get("/api/chats", response_model=List[ChatInDB])
-async def get_all_chats():
-    """Get all chat histories"""
-    db = get_database()
+async def get_chats(current_user: UserInDB = Depends(get_current_active_user)):
+    """Get all chats for the current user"""
+    db = await get_user_data_db(current_user)
     if db is not None:
-        chats = await db.chats.find().sort("updated_at", -1).to_list(100)
+        chats = await db.chats.find({"user_id": current_user.id}).sort("updated_at", -1).to_list(100)
         return [ChatInDB(**{**chat, "_id": str(chat["_id"])}) for chat in chats]
     return []
 
 @app.get("/api/chats/{chat_id}", response_model=ChatInDB)
-async def get_chat(chat_id: str):
+async def get_chat(chat_id: str, current_user: UserInDB = Depends(get_current_active_user)):
     """Get a specific chat by ID"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is not None:
         try:
-            chat = await db.chats.find_one({"_id": ObjectId(chat_id)})
+            chat = await db.chats.find_one({"_id": ObjectId(chat_id), "user_id": current_user.id})
             if chat:
                 return ChatInDB(**{**chat, "_id": str(chat["_id"])})
         except Exception as e:
@@ -1289,13 +1474,14 @@ async def get_chat(chat_id: str):
     raise HTTPException(status_code=404, detail="Chat not found")
 
 @app.post("/api/chats", response_model=ChatInDB, status_code=status.HTTP_201_CREATED)
-async def create_chat(chat: ChatCreate):
+async def create_chat(chat: ChatCreate, current_user: UserInDB = Depends(get_current_active_user)):
     """Create a new chat"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     chat_dict = {
         "title": chat.title,
         "messages": [msg.dict() for msg in chat.messages],
         "note_id": chat.note_id,
+        "user_id": current_user.id, # Add user_id
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow()
     }
@@ -1308,9 +1494,9 @@ async def create_chat(chat: ChatCreate):
     raise HTTPException(status_code=500, detail="Database not available")
 
 @app.put("/api/chats/{chat_id}", response_model=ChatInDB)
-async def update_chat(chat_id: str, chat_update: ChatUpdate):
+async def update_chat(chat_id: str, chat_update: ChatUpdate, current_user: UserInDB = Depends(get_current_active_user)):
     """Update a chat"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     update_data = {k: v for k, v in chat_update.dict().items() if v is not None}
     
     # Convert messages to dict if present
@@ -1322,7 +1508,7 @@ async def update_chat(chat_id: str, chat_update: ChatUpdate):
     if db is not None:
         try:
             result = await db.chats.find_one_and_update(
-                {"_id": ObjectId(chat_id)},
+                {"_id": ObjectId(chat_id), "user_id": current_user.id},
                 {"$set": update_data},
                 return_document=True
             )
@@ -1334,12 +1520,12 @@ async def update_chat(chat_id: str, chat_update: ChatUpdate):
     raise HTTPException(status_code=404, detail="Chat not found")
 
 @app.delete("/api/chats/{chat_id}")
-async def delete_chat(chat_id: str):
+async def delete_chat(chat_id: str, current_user: UserInDB = Depends(get_current_active_user)):
     """Delete a chat"""
-    db = get_database()
+    db = await get_user_data_db(current_user)
     if db is not None:
         try:
-            result = await db.chats.delete_one({"_id": ObjectId(chat_id)})
+            result = await db.chats.delete_one({"_id": ObjectId(chat_id), "user_id": current_user.id})
             if result.deleted_count:
                 return {"message": "Chat deleted successfully"}
         except Exception as e:
@@ -1349,10 +1535,70 @@ async def delete_chat(chat_id: str):
 
 # ==================== Settings Routes ====================
 
+
+DEFAULT_SYSTEM_PROMPT = """✅ SYSTEM PROMPT — “Respond Like ChatGPT (Technical + Clear)”
+
+You are an AI assistant that responds with:
+
+✅ 1. Clear and Structured Explanations
+Break answers into short sections and steps.
+Use headings, bullet points, and examples.
+Avoid long paragraphs.
+
+✅ 2. Beginner-Friendly Technical Help
+Explain concepts simply.
+Provide step-by-step instructions.
+Include code examples when helpful.
+
+✅ 3. Accurate + Practical Guidance
+Provide instructions that realistically work in real-world scenarios.
+Avoid generic or vague answers.
+
+✅ 4. Debugging Support
+When the user reports an error:
+Explain the cause clearly.
+Provide exact fixes.
+Show corrected code.
+
+✅ 5. No Fluff
+No motivational quotes.
+No unnecessary chatting.
+Only direct, useful information.
+
+✅ 6. Smart Assumptions
+If the user gives incomplete info:
+Do not ask for clarification unless absolutely needed.
+Make a reasonable assumption and continue the solution.
+
+✅ 7. Examples and Templates
+When useful:
+Provide working templates.
+Provide ready-to-copy code.
+Provide correct configuration.
+
+✅ 8. Formatting
+Always use **Markdown** formatting in your responses.
+Use headers (#, ##, ###), **bold**, *italic*, code blocks (```), and bullet points.
+Never use raw HTML tags like <p>, <strong>, <ul>, etc.
+
+✅ 9. Tone
+Friendly and professional.
+Confident and reliable.
+No slang.
+
+🧠 Example Style
+User: “How to fix Invalid Token Audience in Google Login?”
+Assistant:
+Explain the cause
+Show the fix
+Provide backend + frontend code
+Provide URLs to configure
+Use concise step-by-step format"""
+
 @app.get("/api/settings", response_model=LLMSettingsInDB)
-async def get_settings(current_user: UserInDB = Depends(get_current_active_user)):
-    """Get user's LLM settings"""
-    db = get_database()
+async def get_llm_settings(current_user: UserInDB = Depends(get_current_active_user)):
+    """Get LLM settings for current user"""
+    db = await get_user_data_db(current_user)
     if db is not None:
         # Try to find user's settings
         settings = await db.llm_settings.find_one({"user_id": current_user.id})
@@ -1363,6 +1609,7 @@ async def get_settings(current_user: UserInDB = Depends(get_current_active_user)
         default_settings = {
             "user_id": current_user.id,
             "providers": [],
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
             "updated_at": datetime.utcnow()
         }
         result = await db.llm_settings.insert_one(default_settings)
@@ -1373,11 +1620,28 @@ async def get_settings(current_user: UserInDB = Depends(get_current_active_user)
     return LLMSettingsInDB(_id="memory", providers=[])
 
 @app.put("/api/settings", response_model=LLMSettingsInDB)
-async def update_settings(settings: LLMSettings, current_user: UserInDB = Depends(get_current_active_user)):
-    """Update user's LLM settings"""
-    db = get_database()
+async def update_llm_settings(settings: LLMSettings, current_user: UserInDB = Depends(get_current_active_user)):
+    """Update LLM settings for current user"""
+    print(f"📥 Received Settings Update Request: {settings}")
+    db = await get_user_data_db(current_user)
     if db is not None:
         update_data = settings.dict()
+        print(f"📦 Update Data Dict: {update_data}")
+        
+        # Ensure at least one provider is active if providers exist
+        providers = update_data.get("providers", [])
+        if providers:
+            has_active = any(p.get("is_active") for p in providers)
+            if not has_active:
+                print("⚠️ No active provider found in update, activating the first one.")
+                providers[0]["is_active"] = True
+                update_data["providers"] = providers
+        
+        # Log what we are saving
+        print(f"💾 Saving Settings for user {current_user.id}")
+        for i, p in enumerate(providers):
+            print(f"  Provider {i}: {p.get('name')} - Active: {p.get('is_active')} - Model: {p.get('model')}")
+
         update_data["user_id"] = current_user.id
         update_data["updated_at"] = datetime.utcnow()
         
@@ -1386,11 +1650,166 @@ async def update_settings(settings: LLMSettings, current_user: UserInDB = Depend
             {"user_id": current_user.id},
             {"$set": update_data},
             upsert=True,
-            return_document=True
+            return_document=ReturnDocument.AFTER
         )
         return LLMSettingsInDB(**{**settings_doc, "_id": str(settings_doc["_id"])})
     
     raise HTTPException(status_code=500, detail="Database not available")
+
+
+@app.post("/api/test-llm-connection", response_model=TestLLMConnectionResponse)
+async def test_llm_connection(request: TestLLMConnectionRequest, current_user: UserInDB = Depends(get_current_active_user)):
+    """Test if an LLM provider configuration is valid"""
+    try:
+        # Determine API endpoint and headers based on provider
+        provider_configs = {
+            "openrouter": {
+                "url": "https://openrouter.ai/api/v1/chat/completions",
+                "headers": {
+                    "Authorization": f"Bearer {request.api_key}",
+                    "Content-Type": "application/json"
+                }
+            },
+            "openai": {
+                "url": "https://api.openai.com/v1/chat/completions",
+                "headers": {
+                    "Authorization": f"Bearer {request.api_key}",
+                    "Content-Type": "application/json"
+                }
+            },
+            "anthropic": {
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": {
+                    "x-api-key": request.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json"
+                }
+            },
+            "gemini": {
+                "url": f"https://generativelanguage.googleapis.com/v1beta/models/{request.model}:generateContent?key={request.api_key}",
+                "headers": {
+                    "Content-Type": "application/json"
+                }
+            }
+        }
+        
+        config = provider_configs.get(request.provider)
+        if not config:
+            return TestLLMConnectionResponse(
+                success=False,
+                message=f"Provider '{request.provider}' is not supported for testing yet",
+                error_type="unsupported_provider"
+            )
+        
+        # Prepare request payload based on provider
+        if request.provider == "anthropic":
+            payload = {
+                "model": request.model,
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 5
+            }
+        elif request.provider == "gemini":
+            payload = {
+                "contents": [{"parts": [{"text": "test"}]}]
+            }
+        else:  # OpenRouter, OpenAI, and others use standard format
+            payload = {
+                "model": request.model,
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 5
+            }
+        
+        # Make API call
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                config["url"],
+                headers=config["headers"],
+                json=payload,
+                timeout=15.0
+            )
+            
+            # Log response for debugging
+            print(f"🔍 Test Connection - Provider: {request.provider}, Model: {request.model}")
+            print(f"📊 Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                return TestLLMConnectionResponse(
+                    success=True,
+                    message=f"✅ Successfully connected to {request.model}"
+                )
+            
+            # Parse error response
+            try:
+                error_data = response.json() if response.text else {}
+                print(f"❌ Error Response: {error_data}")
+            except:
+                error_data = {}
+                print(f"❌ Raw Error Response: {response.text}")
+            
+            # Extract error message from different provider formats
+            error_message = None
+            if "error" in error_data:
+                if isinstance(error_data["error"], dict):
+                    error_message = error_data["error"].get("message") or error_data["error"].get("error")
+                elif isinstance(error_data["error"], str):
+                    error_message = error_data["error"]
+            elif "message" in error_data:
+                error_message = error_data["message"]
+            elif "detail" in error_data:
+                error_message = error_data["detail"]
+            
+            # Fallback to full error data if no message found
+            if not error_message and error_data:
+                error_message = str(error_data)
+            
+            if response.status_code == 401 or response.status_code == 403:
+                return TestLLMConnectionResponse(
+                    success=False,
+                    message="Invalid API key. Please check your credentials and try again.",
+                    error_type="invalid_key"
+                )
+            elif response.status_code == 402 or response.status_code == 429:
+                return TestLLMConnectionResponse(
+                    success=False,
+                    message="Rate limit exceeded or insufficient credits. Please check your account.",
+                    error_type="no_credits"
+                )
+            elif response.status_code == 404:
+                return TestLLMConnectionResponse(
+                    success=False,
+                    message=f"Model '{request.model}' is not available. Please verify the model name is correct.",
+                    error_type="invalid_model"
+                )
+            elif response.status_code >= 500:
+                return TestLLMConnectionResponse(
+                    success=False,
+                    message="Provider server error. Please try again later.",
+                    error_type="api_error"
+                )
+            else:
+                # For other errors, try to provide helpful message
+                return TestLLMConnectionResponse(
+                    success=False,
+                    message=f"Connection failed (HTTP {response.status_code}). Please check your configuration.",
+                    error_type="api_error"
+                )
+                
+    except httpx.TimeoutException:
+        print(f"⏱️ Connection timeout for {request.provider}/{request.model}")
+        return TestLLMConnectionResponse(
+            success=False,
+            message="Connection timeout. Please check your internet connection.",
+            error_type="timeout"
+        )
+    except Exception as e:
+        print(f"💥 Unexpected error testing {request.provider}/{request.model}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return TestLLMConnectionResponse(
+            success=False,
+            message="Connection test failed. Please check your settings and try again.",
+            error_type="unknown"
+        )
 
 if __name__ == "__main__":
     import uvicorn
