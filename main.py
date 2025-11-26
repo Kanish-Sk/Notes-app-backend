@@ -48,10 +48,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Notion-like Notes API", version="1.0.0", lifespan=lifespan)
 
-# CORS middleware
+# CORS middleware - Allow localhost for development and frontend URL from env for production
+frontend_url = os.getenv("FRONTEND_URL", "")
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+]
+
+# Add production frontend URL if provided
+if frontend_url:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
