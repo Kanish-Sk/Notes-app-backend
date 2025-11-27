@@ -1379,6 +1379,15 @@ Be concise and helpful."""
             }
             if system_instruction:
                 payload["systemInstruction"] = system_instruction
+        elif provider_type == "ollama":
+            # Ollama API - api_key is actually the base URL (e.g., http://localhost:11434)
+            url = f"{api_key}/api/chat"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False
+            }
         else:
             # Default to OpenRouter
             url = "https://openrouter.ai/api/v1/chat/completions"
@@ -1421,6 +1430,9 @@ Be concise and helpful."""
                 ai_message = result["content"][0]["text"]
             elif provider_type == "gemini":
                 ai_message = result["candidates"][0]["content"]["parts"][0]["text"]
+            elif provider_type == "ollama":
+                # Ollama format
+                ai_message = result["message"]["content"]
             else:
                 # OpenAI / OpenRouter format
                 ai_message = result["choices"][0]["message"]["content"]
@@ -1690,6 +1702,12 @@ async def test_llm_connection(request: TestLLMConnectionRequest, current_user: U
                 "headers": {
                     "Content-Type": "application/json"
                 }
+            },
+            "ollama": {
+                "url": f"{request.api_key}/api/chat",  # api_key field used as base URL for Ollama
+                "headers": {
+                    "Content-Type": "application/json"
+                }
             }
         }
         
@@ -1711,6 +1729,12 @@ async def test_llm_connection(request: TestLLMConnectionRequest, current_user: U
         elif request.provider == "gemini":
             payload = {
                 "contents": [{"parts": [{"text": "test"}]}]
+            }
+        elif request.provider == "ollama":
+            payload = {
+                "model": request.model,
+                "messages": [{"role": "user", "content": "test"}],
+                "stream": False
             }
         else:  # OpenRouter, OpenAI, and others use standard format
             payload = {
