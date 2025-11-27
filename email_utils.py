@@ -12,31 +12,60 @@ from googleapiclient.errors import HttpError
 SCOPES = ['https://www.googleapis.com/auth/gmail.send']
 
 def get_gmail_service():
-    """Get Gmail API service"""
+    """Get Gmail API service - Render-compatible with env variables"""
+    import json
     creds = None
-    token_file = os.getenv('GMAIL_TOKEN_FILE', 'token.json')
+    
+    # For Render: Use /tmp for writable storage since secret files are read-only
+    token_file = '/tmp/token.json'
     credentials_file = os.getenv('GMAIL_CREDENTIALS_FILE', 'credentials.json')
+    
+    # Check if token.json content is in environment variable (for Render)
+    token_json_content = os.getenv('GMAIL_TOKEN_JSON')
+    if token_json_content:
+        # Write token content to /tmp/token.json
+        try:
+            token_data = json.loads(token_json_content)
+            with open(token_file, 'w') as f:
+                json.dump(token_data, f)
+            print("✅ Token loaded from GMAIL_TOKEN_JSON environment variable")
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Failed to parse GMAIL_TOKEN_JSON: {e}")
+    
+    # Check if credentials.json content is in environment variable (for Render)
+    credentials_json_content = os.getenv('GMAIL_CREDENTIALS_JSON')
+    if credentials_json_content:
+        # Write credentials to /tmp/credentials.json
+        try:
+            creds_data = json.loads(credentials_json_content)
+            credentials_file = '/tmp/credentials.json'
+            with open(credentials_file, 'w') as f:
+                json.dump(creds_data, f)
+            print("✅ Credentials loaded from GMAIL_CREDENTIALS_JSON environment variable")
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Failed to parse GMAIL_CREDENTIALS_JSON: {e}")
     
     # The file token.json stores the user's access and refresh tokens
     if os.path.exists(token_file):
         creds = Credentials.from_authorized_user_file(token_file, SCOPES)
     
-    # If there are no (valid) credentials available, let the user log in.
+    # If there are no (valid) credentials available, refresh or fail gracefully
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+                # Save refreshed token back to /tmp
+                with open(token_file, 'w') as token:
+                    token.write(creds.to_json())
+                print("✅ Token refreshed successfully")
+            except Exception as e:
+                print(f"⚠️  Failed to refresh token: {e}")
+                raise
         else:
-            if not os.path.exists(credentials_file):
-                raise FileNotFoundError(
-                    f"Gmail credentials file '{credentials_file}' not found. "
-                    "Please download OAuth 2.0 credentials from Google Cloud Console."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Save the credentials for the next run
-        with open(token_file, 'w') as token:
-            token.write(creds.to_json())
+            raise FileNotFoundError(
+                "Gmail token is invalid or missing. Please set GMAIL_TOKEN_JSON environment variable "
+                "with the content of your token.json file."
+            )
     
     return build('gmail', 'v1', credentials=creds)
 
