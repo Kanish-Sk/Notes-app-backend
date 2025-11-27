@@ -101,6 +101,7 @@ class LLMProvider(BaseModel):
     is_active: bool = False
     system_prompt: Optional[str] = None  # Custom system prompt for this provider
     use_global_prompt: bool = False  # If true, use global prompt instead of provider prompt
+    tested: bool = False  # Tracks if connection has been tested successfully
 
 class LLMSettings(BaseModel):
     providers: List[LLMProvider] = []
