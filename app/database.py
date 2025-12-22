@@ -2,7 +2,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.server_api import ServerApi
 import os
 from dotenv import load_dotenv
-from logger import get_logger
+from .logger import get_logger
 
 load_dotenv()
 

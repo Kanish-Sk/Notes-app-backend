@@ -11,11 +11,12 @@ import traceback
 from dotenv import load_dotenv
 import httpx
 
+
 from app.models import (
-    Note, NoteCreate, NoteUpdate, NoteInDB, 
+    NoteCreate, NoteUpdate, NoteInDB, 
     UserCreate, UserInDB, UserLogin, 
     FolderCreate, FolderUpdate, FolderInDB, 
-    ShareNoteRequest, LLMSettings, ChatMessage, ChatRequest, LLMTestRequest, 
+    ShareNoteRequest, LLMSettings, ChatMessage, 
     Token, RefreshTokenData, GoogleAuthRequest, 
     ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, 
     MongoDBConnectionRequest, MongoDBConnectionResponse, 
@@ -30,7 +31,7 @@ from app.auth import (
     get_user_by_email, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 )
 from app.database import connect_to_mongo, close_mongo_connection, get_database, get_client
-from app.user_database import get_user_data_db
+from app.user_database import get_user_database
 from app.email_utils import send_password_reset_email, send_share_notification_email
 from app.logger import setup_logging, get_logger
 from pymongo import ReturnDocument
@@ -89,7 +90,7 @@ async def get_user_data_db(current_user: UserInDB):
     """
     # If user has configured their own database, use it
     if current_user.has_database and current_user.mongodb_connection_string:
-        from user_database import get_user_database
+        from app.user_database import get_user_database
         try:
             user_db = await get_user_database(
                 current_user.id,
@@ -138,7 +139,7 @@ async def get_statistics():
 @app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate):
     """Register a new user with email and password"""
-    from user_database import verify_mongodb_connection, encrypt_connection_string
+    from app.user_database import verify_mongodb_connection, encrypt_connection_string
     
     db = get_database()
     if db is None:
@@ -606,7 +607,7 @@ async def search_users(query: str, current_user: UserInDB = Depends(get_current_
 @app.post("/api/verify-mongodb", response_model=MongoDBConnectionResponse)
 async def verify_mongodb_connection_endpoint(request: MongoDBConnectionRequest):
     """Verify MongoDB connection string (no auth required for testing during registration)"""
-    from user_database import verify_mongodb_connection
+    from app.user_database import verify_mongodb_connection
     
     success, message = await verify_mongodb_connection(request.connection_string)
     return MongoDBConnectionResponse(success=success, message=message)
@@ -617,7 +618,7 @@ async def update_user_database(
     current_user: UserInDB = Depends(get_current_active_user)
 ):
     """Update user's MongoDB connection string (for Google login users)"""
-    from user_database import verify_mongodb_connection, encrypt_connection_string
+    from app.user_database import verify_mongodb_connection, encrypt_connection_string
     
     db = get_database()
     if db is None:
@@ -698,7 +699,7 @@ def can_edit_folder(folder: dict, user_id: str) -> bool:
 @app.get("/api/notes", response_model=List[NoteInDB])
 async def get_all_notes(current_user: UserInDB = Depends(get_current_active_user)):
     """Get all notes (owned and shared) - shared notes are fetched live from owner's DB"""
-    from user_database import get_user_database
+    from app.user_database import get_user_database
     
     db = await get_user_data_db(current_user)
     main_db = get_database()
@@ -884,7 +885,7 @@ async def create_folder(folder: FolderCreate, current_user: UserInDB = Depends(g
 
 @app.get("/api/folders", response_model=List[FolderInDB])
 async def list_folders(current_user: UserInDB = Depends(get_current_active_user)):
-    from user_database import get_user_database
+    from app.user_database import get_user_database
     
     db = await get_user_data_db(current_user)
     main_db = get_database()

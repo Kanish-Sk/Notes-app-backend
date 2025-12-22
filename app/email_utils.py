@@ -7,7 +7,7 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from logger import get_logger
+from .logger import get_logger
 
 # Setup logger
 logger = get_logger(__name__)

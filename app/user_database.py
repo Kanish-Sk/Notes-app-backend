@@ -7,7 +7,7 @@ from typing import Optional, Dict
 import asyncio
 from cryptography.fernet import Fernet
 import os
-from logger import get_logger
+from .logger import get_logger
 
 # Setup logger
 logger = get_logger(__name__)

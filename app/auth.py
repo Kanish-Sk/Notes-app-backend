@@ -4,8 +4,8 @@ from jose import JWTError, jwt
 import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from database import get_database
-from models import TokenData, UserInDB
+from .database import get_database
+from .models import TokenData, UserInDB
 from bson import ObjectId
 import os
 from dotenv import load_dotenv
