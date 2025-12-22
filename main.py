@@ -1180,6 +1180,8 @@ async def share_folder(
     for note in all_user_notes:
         logger.info(f"     - '{note.get('title')}' folder_id={note.get('folder_id')} (type: {type(note.get('folder_id'))})")
     
+    # Notes store folder_id as strings, so we use all_folder_ids directly
+    logger.info(f"📝 DEBUG: Looking for notes with folder_id in: {all_folder_ids}")
     notes_in_folders = await db.notes.find({
         "folder_id": {"$in": all_folder_ids}
     }).to_list(1000)
@@ -1190,6 +1192,8 @@ async def share_folder(
     if notes_in_folders:
         for note in notes_in_folders:
             logger.info(f"     - Note: '{note.get('title')}' in folder {note.get('folder_id')}")
+    else:
+        logger.warning(f"   ⚠️  No notes found! Check if folder_id types match")
     
     logger.info(f"📁 Sharing {len(all_folder_ids)} folders (1 parent + {len(child_folders)} children) + {len(notes_in_folders)} notes")
     
