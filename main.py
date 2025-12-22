@@ -1,40 +1,39 @@
-from fastapi import FastAPI, HTTPException, status, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from bson import ObjectId
-from contextlib import asynccontextmanager
+from typing import Optional, List, Dict
 import os
+import json
+import traceback
 from dotenv import load_dotenv
 import httpx
 
-from database import connect_to_mongo, close_mongo_connection, get_database, get_client
+from app.models import (
+    Note, NoteCreate, NoteUpdate, NoteInDB, 
+    UserCreate, UserInDB, UserLogin, 
+    FolderCreate, FolderUpdate, FolderInDB, 
+    ShareNoteRequest, LLMSettings, ChatMessage, ChatRequest, LLMTestRequest, 
+    Token, RefreshTokenData, GoogleAuthRequest, 
+    ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, 
+    MongoDBConnectionRequest, MongoDBConnectionResponse, 
+    TestLLMConnectionRequest, TestLLMConnectionResponse, 
+    AIRequest, AIResponse, ChatCreate, ChatUpdate, ChatInDB, 
+    LLMProvider, LLMSettingsInDB, User
+)
+from app.auth import (
+    get_password_hash, verify_password, 
+    authenticate_user, create_access_token, create_refresh_token,
+    verify_refresh_token, get_current_user, get_current_active_user,
+    get_user_by_email, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
+)
+from app.database import connect_to_mongo, close_mongo_connection, get_database, get_client
+from app.user_database import get_user_data_db
+from app.email_utils import send_password_reset_email, send_share_notification_email
+from app.logger import setup_logging, get_logger
 from pymongo import ReturnDocument
-from models import (
-    NoteCreate, NoteUpdate, NoteInDB, 
-    FolderCreate, FolderUpdate, FolderInDB,
-    AIRequest, AIResponse, 
-    ChatCreate, ChatUpdate, ChatInDB, 
-    LLMProvider, LLMSettings, LLMSettingsInDB,
-    User, UserInDB, UserCreate, UserLogin, Token, RefreshTokenData, GoogleAuthRequest,
-    ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, ShareNoteRequest,
-    MongoDBConnectionRequest, MongoDBConnectionResponse,
-    TestLLMConnectionRequest, TestLLMConnectionResponse
-)
-from auth import (
-    get_password_hash, 
-    authenticate_user, 
-    create_access_token,
-    create_refresh_token,
-    verify_refresh_token,
-    get_current_user,
-    get_current_active_user,
-    get_user_by_email,
-    ACCESS_TOKEN_EXPIRE_MINUTES,
-    REFRESH_TOKEN_EXPIRE_DAYS
-)
-from email_utils import send_share_notification_email
-from logger import setup_logging, get_logger
 
 load_dotenv()
 
