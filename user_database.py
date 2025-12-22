@@ -7,6 +7,10 @@ from typing import Optional, Dict
 import asyncio
 from cryptography.fernet import Fernet
 import os
+from logger import get_logger
+
+# Setup logger
+logger = get_logger(__name__)
 
 # Connection pool for user databases
 user_db_connections: Dict[str, AsyncIOMotorClient] = {}
@@ -52,8 +56,8 @@ async def verify_mongodb_connection(connection_string: str) -> tuple[bool, str]:
     
     except Exception as e:
         error_msg = str(e)
-        print(f"❌ MongoDB Connection Error: {error_msg}")  # Debug logging
-        print(f"   Connection string starts with: {connection_string[:20]}...")  # Show beginning of connection string
+        logger.error(f"❌ MongoDB Connection Error: {error_msg}")  # Debug logging
+        logger.info(f"   Connection string starts with: {connection_string[:20]}...")  # Show beginning of connection string
         
         if "authentication" in error_msg.lower():
             return False, "Authentication failed. Please check your credentials."
@@ -102,7 +106,7 @@ async def get_user_database(user_id: str, connection_string: str, database_name:
             return client[database_name]
         
         except Exception as e:
-            print(f"Error creating user database connection: {e}")
+            logger.error(f"Error creating user database connection: {e}")
             raise
 
 

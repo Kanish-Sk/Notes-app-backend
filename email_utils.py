@@ -7,6 +7,10 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from logger import get_logger
+
+# Setup logger
+logger = get_logger(__name__)
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.send']
@@ -28,9 +32,9 @@ def get_gmail_service():
             token_data = json.loads(token_json_content)
             with open(token_file, 'w') as f:
                 json.dump(token_data, f)
-            print("✅ Token loaded from GMAIL_TOKEN_JSON environment variable")
+            logger.info("✅ Token loaded from GMAIL_TOKEN_JSON environment variable")
         except json.JSONDecodeError as e:
-            print(f"⚠️  Failed to parse GMAIL_TOKEN_JSON: {e}")
+            logger.warning(f"⚠️  Failed to parse GMAIL_TOKEN_JSON: {e}")
     
     # Check if credentials.json content is in environment variable (for Render)
     credentials_json_content = os.getenv('GMAIL_CREDENTIALS_JSON')
@@ -41,9 +45,9 @@ def get_gmail_service():
             credentials_file = '/tmp/credentials.json'
             with open(credentials_file, 'w') as f:
                 json.dump(creds_data, f)
-            print("✅ Credentials loaded from GMAIL_CREDENTIALS_JSON environment variable")
+            logger.info("✅ Credentials loaded from GMAIL_CREDENTIALS_JSON environment variable")
         except json.JSONDecodeError as e:
-            print(f"⚠️  Failed to parse GMAIL_CREDENTIALS_JSON: {e}")
+            logger.warning(f"⚠️  Failed to parse GMAIL_CREDENTIALS_JSON: {e}")
     
     # The file token.json stores the user's access and refresh tokens
     if os.path.exists(token_file):
@@ -57,9 +61,9 @@ def get_gmail_service():
                 # Save refreshed token back to /tmp
                 with open(token_file, 'w') as token:
                     token.write(creds.to_json())
-                print("✅ Token refreshed successfully")
+                logger.info("✅ Token refreshed successfully")
             except Exception as e:
-                print(f"⚠️  Failed to refresh token: {e}")
+                logger.warning(f"⚠️  Failed to refresh token: {e}")
                 raise
         else:
             raise FileNotFoundError(
@@ -95,17 +99,17 @@ async def send_email(to_email: str, subject: str, html_content: str) -> bool:
         
         # Send the message
         service.users().messages().send(userId='me', body=message).execute()
-        print(f"✅ Email sent successfully to {to_email}")
+        logger.info(f"✅ Email sent successfully to {to_email}")
         return True
         
     except HttpError as error:
-        print(f"❌ Gmail API error: {error}")
+        logger.error(f"❌ Gmail API error: {error}")
         return False
     except FileNotFoundError as error:
-        print(f"❌ {error}")
+        logger.error(f"❌ {error}")
         return False
     except Exception as error:
-        print(f"❌ Error sending email: {error}")
+        logger.error(f"❌ Error sending email: {error}")
         return False
 
 async def send_password_reset_email(email: str, code: str) -> bool:

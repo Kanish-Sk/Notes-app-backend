@@ -35,8 +35,18 @@ class NoteUpdate(BaseModel):
 
 class NoteInDB(NoteBase):
     id: str = Field(default_factory=lambda: str(ObjectId()), alias="_id")
+    user_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    # Shared note fields
+    is_shared: bool = False
+    original_note_id: Optional[str] = None  # ID of the original note if this is a shared copy
+    original_owner_id: Optional[str] = None
+    original_owner_email: Optional[str] = None
+    shared_by: Optional[str] = None  # Email of who shared
+    shared_by_name: Optional[str] = None
+    shared_at: Optional[datetime] = None
+    share_history: List[dict] = []  # History of shares for owner's view
     
     class Config:
         populate_by_name = True
@@ -60,6 +70,10 @@ class FolderInDB(FolderBase):
     id: str = Field(default_factory=lambda: str(ObjectId()), alias="_id")
     user_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Shared folder fields
+    is_shared: bool = False
+    shared_by: Optional[str] = None  # Email of who shared
+    original_owner_id: Optional[str] = None
     
     class Config:
         populate_by_name = True
