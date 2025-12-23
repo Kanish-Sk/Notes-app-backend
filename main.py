@@ -1997,30 +1997,34 @@ async def ai_chat(request: AIRequest, current_user: UserInDB = Depends(get_curre
         provider_system_prompt = (selected_provider.get("system_prompt") or "").strip()
         global_system_prompt = (settings_doc.get("system_prompt") or "").strip()
         
+        # Default system prompt based on edit mode
+        if request.edit_mode:
+            system_prompt = """You are a helpful AI assistant that edits note documents.
+
+IMPORTANT: Your response will REPLACE the entire note content. You MUST return the complete, updated note including:
+- All existing content that should be kept
+- Your edits/changes applied
+- Proper markdown formatting
+
+User requests may ask you to:
+- Improve/rewrite specific sections
+- Fix grammar and spelling throughout
+- Add or remove content
+- Reorganize or restructure
+- Change tone or style
+
+ALWAYS return the FULL note content with your modifications applied, not just the changed parts.
+Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
+        else:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
+        
+        # Override with custom prompt if explicitly enabled
         if use_global and global_system_prompt:
             # Provider explicitly wants to use global prompt
             system_prompt = global_system_prompt
         elif provider_system_prompt:
             # Use provider-specific system prompt
             system_prompt = provider_system_prompt
-        elif global_system_prompt:
-            # Fall back to globalprompt
-            system_prompt = global_system_prompt
-        else:
-            # Use default system prompt based on edit mode
-            if request.edit_mode:
-                system_prompt = """You are a helpful AI assistant for a note-taking app. 
-Your task is to help users improve their notes. You can:
-- Summarize content
-- Improve writing clarity and structure
-- Fix grammar and spelling
-- Add formatting suggestions
-- Reorganize information
-
-When editing, provide the complete updated note content in markdown format.
-Be concise and helpful."""
-            else:
-                system_prompt = DEFAULT_SYSTEM_PROMPT
         
         # Prepare messages
         messages = [
@@ -2166,16 +2170,11 @@ Be concise and helpful."""
             logger.info(f"  💬 AI Message Length: {len(ai_message)} chars")
             logger.info(f"  💬 AI Message Preview: {ai_message[:200] if ai_message else 'EMPTY!'}")
         
-        # If edit mode is enabled, prepare updated content
+        # If edit mode is enabled, use AI response as the updated content
         updated_content = None
         if request.edit_mode:
-            # Check if the AI provided a complete note or just suggestions
-            if ai_message.startswith('#') or len(ai_message) > len(request.current_content) * 0.5:
-                # AI provided complete content
-                updated_content = ai_message
-            else:
-                # AI provided suggestions, append them
-                updated_content = request.current_content + f"\n\n---\n\n**AI Suggestions:**\n{ai_message}"
+            # AI has been instructed to provide complete document
+            updated_content = ai_message
         
         return AIResponse(message=ai_message, updated_content=updated_content)
     
