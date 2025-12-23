@@ -2125,7 +2125,8 @@ Be concise and helpful."""
             payload = {
                 "model": model,
                 "messages": messages,
-                "temperature": 0.7
+                "temperature": 0.7,
+                "max_tokens": 4096  # Limit to prevent credit issues
             }
 
         # Make API call
