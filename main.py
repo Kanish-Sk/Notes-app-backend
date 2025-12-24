@@ -21,6 +21,7 @@ from app.models import (
     ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, 
     MongoDBConnectionRequest, MongoDBConnectionResponse, 
     TestLLMConnectionRequest, TestLLMConnectionResponse, 
+    CloudinaryTestRequest, CloudinaryTestResponse, CloudinaryUpdateRequest,
     AIRequest, AIResponse, ChatCreate, ChatUpdate, ChatInDB, 
     LLMProvider, LLMSettingsInDB, User
 )
@@ -106,6 +107,36 @@ async def get_user_data_db(current_user: UserInDB):
     else:
         # Use main database
         return get_database()
+
+def get_decrypted_cloudinary_credentials(user_dict: dict) -> dict:
+    """
+    Helper to decrypt Cloudinary credentials from user document.
+    Returns dict with decrypted credentials or None values.
+    """
+    from app.user_database import decrypt_connection_string
+    
+    result = {
+        "cloudinary_cloud_name": user_dict.get("cloudinary_cloud_name"),  # Plain text
+        "cloudinary_api_key": None,
+        "cloudinary_api_secret": None
+    }
+    
+    # Decrypt API key if exists
+    if user_dict.get("cloudinary_api_key"):
+        try:
+            result["cloudinary_api_key"] = decrypt_connection_string(user_dict["cloudinary_api_key"])
+        except Exception as e:
+            logger.warning(f"Failed to decrypt cloudinary_api_key: {e}")
+    
+    # Decrypt API secret if exists
+    if user_dict.get("cloudinary_api_secret"):
+        try:
+            result["cloudinary_api_secret"] = decrypt_connection_string(user_dict["cloudinary_api_secret"])
+        except Exception as e:
+            logger.warning(f"Failed to decrypt cloudinary_api_secret: {e}")
+    
+    return result
+
 
 
 @app.get("/api/stats")
@@ -244,23 +275,34 @@ async def login(user_data: UserLogin):
     
     # Store refresh token in database
     db = get_database()
+    user_dict = None
     if db is not None:
         await db.users.update_one(
             {"_id": ObjectId(user.id)},
             {"$push": {"refresh_tokens": refresh_token}}
         )
+        # Fetch full user document for Cloudinary credentials
+        user_dict = await db.users.find_one({"_id": ObjectId(user.id)})
+    
+    # Prepare user response with decrypted Cloudinary credentials
+    user_response = {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "picture": user.picture,
+        "has_database": user.has_database,
+        "mongodb_connection_string": user.mongodb_connection_string
+    }
+    
+    # Add decrypted Cloudinary credentials if available
+    if user_dict:
+        cloudinary_creds = get_decrypted_cloudinary_credentials(user_dict)
+        user_response.update(cloudinary_creds)
     
     return Token(
         access_token=access_token,
         refresh_token=refresh_token,
-        user={
-            "id": user.id,
-            "email": user.email,
-            "full_name": user.full_name,
-            "picture": user.picture,
-            "has_database": user.has_database,
-            "mongodb_connection_string": user.mongodb_connection_string
-        }
+        user=user_response
     )
 
 @app.post("/api/auth/google", response_model=Token)
@@ -661,6 +703,138 @@ async def update_user_database(
         }
     
     return {"message": "Database connection updated successfully", "has_database": True}
+
+@app.patch("/api/users/me/cloudinary")
+async def update_cloudinary_settings(
+    request: CloudinaryUpdateRequest,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """Update user's Cloudinary credentials for image uploads (encrypted storage)"""
+    from app.user_database import encrypt_connection_string
+    
+    db = get_database()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    # Encrypt sensitive credentials before storing
+    encrypted_api_key = encrypt_connection_string(request.cloudinary_api_key)
+    encrypted_api_secret = encrypt_connection_string(request.cloudinary_api_secret)
+    
+    # Update user's Cloudinary settings (cloud_name can stay plain text as it's public)
+    await db.users.update_one(
+        {"_id": ObjectId(current_user.id)},
+        {"$set": {
+            "cloudinary_cloud_name": request.cloudinary_cloud_name,  # Plain text (public info)
+            "cloudinary_api_key": encrypted_api_key,  # Encrypted
+            "cloudinary_api_secret": encrypted_api_secret  # Encrypted
+        }}
+    )
+    
+    # Fetch and return updated user (with decrypted credentials for frontend use)
+    updated_user = await db.users.find_one({"_id": ObjectId(current_user.id)})
+    if updated_user:
+        from app.user_database import decrypt_connection_string
+        
+        # Decrypt credentials for response
+        decrypted_api_key = None
+        decrypted_api_secret = None
+        
+        if updated_user.get("cloudinary_api_key"):
+            try:
+                decrypted_api_key = decrypt_connection_string(updated_user["cloudinary_api_key"])
+            except:
+                pass  # Handle case where old data exists
+        
+        if updated_user.get("cloudinary_api_secret"):
+            try:
+                decrypted_api_secret = decrypt_connection_string(updated_user["cloudinary_api_secret"])
+            except:
+                pass  # Handle case where old data exists
+        
+        user_response = {
+            "id": str(updated_user["_id"]),
+            "email": updated_user.get("email"),
+            "full_name": updated_user.get("full_name"),
+            "picture": updated_user.get("picture"),
+            "has_database": updated_user.get("has_database", False),
+            "cloudinary_cloud_name": updated_user.get("cloudinary_cloud_name"),
+            "cloudinary_api_key": decrypted_api_key,  # Decrypted for frontend
+            "cloudinary_api_secret": decrypted_api_secret,  # Decrypted for frontend
+            "provider": updated_user.get("provider", "email")
+        }
+        return {
+            "message": "Cloudinary settings updated successfully",
+            "user": user_response
+        }
+    
+    return {"message": "Cloudinary settings updated successfully"}
+
+@app.post("/api/test-cloudinary", response_model=CloudinaryTestResponse)
+async def test_cloudinary_credentials(request: CloudinaryTestRequest):
+    """Test Cloudinary credentials without saving (server-side to avoid CORS)"""
+    import httpx
+    import base64
+    
+    try:
+        # Validate cloud name format
+        if not request.cloudinary_cloud_name or not request.cloudinary_cloud_name.strip():
+            return CloudinaryTestResponse(success=False, message="Cloud name is required")
+        
+        # Check for invalid characters in cloud name
+        if not all(c.isalnum() or c in '-_' for c in request.cloudinary_cloud_name):
+            return CloudinaryTestResponse(
+                success=False, 
+                message="Cloud name can only contain letters, numbers, hyphens, and underscores (no spaces)"
+            )
+        
+        # Test the credentials by making an API call to Cloudinary
+        auth_string = f"{request.cloudinary_api_key}:{request.cloudinary_api_secret}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"https://api.cloudinary.com/v1_1/{request.cloudinary_cloud_name}/resources/image",
+                headers={
+                    "Authorization": f"Basic {encoded_auth}"
+                },
+                params={"max_results": 1}  # Just test, don't fetch much data
+            )
+            
+            if response.status_code == 200:
+                return CloudinaryTestResponse(
+                    success=True,
+                    message="Credentials verified successfully! ✓"
+                )
+            elif response.status_code == 401:
+                return CloudinaryTestResponse(
+                    success=False,
+                    message="Invalid API Key or Secret. Please check your credentials."
+                )
+            elif response.status_code == 404:
+                return CloudinaryTestResponse(
+                    success=False,
+                    message="Cloud name not found. Please check your Cloud Name."
+                )
+            else:
+                return CloudinaryTestResponse(
+                    success=False,
+                    message=f"Cloudinary returned status {response.status_code}"
+                )
+                
+    except httpx.TimeoutException:
+        return CloudinaryTestResponse(
+            success=False,
+            message="Connection timeout. Please check your internet connection."
+        )
+    except Exception as e:
+        logger.error(f"Cloudinary test error: {str(e)}")
+        return CloudinaryTestResponse(
+            success=False,
+            message=f"Test failed: {str(e)}"
+        )
+
+
+
 
 # ==================== Access Control Helpers ====================
 
@@ -2543,3 +2717,108 @@ async def test_llm_connection(request: TestLLMConnectionRequest, current_user: U
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
+@app.get("/api/cloudinary/images")
+async def list_cloudinary_images(
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """List all Cloudinary images used in user's notes with usage statistics"""
+    db = get_database()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get all user's notes
+        notes_cursor = db.notes.find({"user_id": current_user.id})
+        notes = await notes_cursor.to_list(length=None)
+        
+        # Extract all Cloudinary image URLs and track which notes use them
+        image_usage = {}
+        
+        import re
+        cloudinary_pattern = r'https://res\.cloudinary\.com/[^"\')\s]+'
+        
+        for note in notes:
+            content = note.get('content', '')
+            images = re.findall(cloudinary_pattern, content)
+            
+            for img_url in images:
+                if img_url not in image_usage:
+                    image_usage[img_url] = []
+                image_usage[img_url].append({
+                    'note_id': str(note['_id']),
+                    'note_title': note.get('title', 'Untitled')
+                })
+        
+        # Format response
+        images_list = []
+        for url, usage in image_usage.items():
+            match = re.search(r'/upload/(?:v\d+/)?(.+?)(?:\.[^.]+)?$', url)
+            public_id = match.group(1) if match else 'unknown'
+            
+            images_list.append({
+                'url': url,
+                'public_id': public_id,
+                'usage_count': len(usage),
+                'used_in_notes': usage
+            })
+        
+        return {
+            'total_images': len(images_list),
+            'images': sorted(images_list, key=lambda x: x['usage_count'], reverse=True)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing Cloudinary images: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/cloudinary/image")
+async def delete_cloudinary_image(
+    image_url: str,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
+    """Delete an image from Cloudinary"""
+    db = get_database()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        user = await db.users.find_one({"_id": ObjectId(current_user.id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        decrypted_creds = get_decrypted_cloudinary_credentials(user)
+        
+        if not decrypted_creds.get('cloudinary_cloud_name'):
+            raise HTTPException(status_code=400, detail="Cloudinary not configured")
+        
+        import re
+        match = re.search(r'/upload/(?:v\d+/)?(.+?)(?:\.[^.]+)?$', image_url)
+        if not match:
+            raise HTTPException(status_code=400, detail="Invalid Cloudinary URL")
+        
+        public_id = match.group(1)
+        
+        import httpx
+        import base64
+        
+        auth_string = f"{decrypted_creds['cloudinary_api_key']}:{decrypted_creds['cloudinary_api_secret']}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                "DELETE",
+                f"https://api.cloudinary.com/v1_1/{decrypted_creds['cloudinary_cloud_name']}/resources/image/upload",
+                headers={"Authorization": f"Basic {encoded_auth}"},
+                json={"public_ids": [public_id]}
+            )
+            
+            if response.status_code in [200, 404]:
+                return {"success": True, "message": "Image deleted from Cloudinary", "public_id": public_id}
+            else:
+                return {"success": False, "message": f"Cloudinary API error: {response.status_code}", "details": response.text}
+                
+    except Exception as e:
+        logger.error(f"Error deleting Cloudinary image: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

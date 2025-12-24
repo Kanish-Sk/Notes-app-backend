@@ -153,6 +153,10 @@ class User(BaseModel):
     mongodb_connection_string: Optional[str] = None  # User's own MongoDB cluster
     has_database: bool = False  # Whether user has configured their database
     notes_count: int = 0  # Track number of notes created by user
+    # Cloudinary configuration for image uploads
+    cloudinary_cloud_name: Optional[str] = None
+    cloudinary_api_key: Optional[str] = None
+    cloudinary_api_secret: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class UserInDB(User):
@@ -220,3 +224,17 @@ class TestLLMConnectionResponse(BaseModel):
     success: bool
     message: str
     error_type: Optional[str] = None
+
+class CloudinaryTestRequest(BaseModel):
+    cloudinary_cloud_name: str
+    cloudinary_api_key: str
+    cloudinary_api_secret: str
+
+class CloudinaryTestResponse(BaseModel):
+    success: bool
+    message: str
+
+class CloudinaryUpdateRequest(BaseModel):
+    cloudinary_cloud_name: str
+    cloudinary_api_key: str
+    cloudinary_api_secret: str
