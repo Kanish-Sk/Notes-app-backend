@@ -135,6 +135,8 @@ class AIRequest(BaseModel):
     message: str
     current_content: str = ""
     edit_mode: bool = False
+    messages: Optional[List[dict]] = None
+
 
 class AIResponse(BaseModel):
     message: str

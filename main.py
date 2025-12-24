@@ -138,6 +138,59 @@ def get_decrypted_cloudinary_credentials(user_dict: dict) -> dict:
     return result
 
 
+async def cleanup_note_images(note_content: str, user_dict: dict):
+    """
+    Find and delete all Cloudinary images in note content.
+    Used as a background task.
+    """
+    if not note_content or not user_dict:
+        return
+        
+    creds = get_decrypted_cloudinary_credentials(user_dict)
+    if not creds.get('cloudinary_cloud_name') or not creds.get('cloudinary_api_key') or not creds.get('cloudinary_api_secret'):
+        return
+        
+    import re
+    import base64
+    
+    # Find all Cloudinary URLs
+    cloudinary_pattern = r'https://res\.cloudinary\.com/[^\"\'\)\s]+'
+    urls = re.findall(cloudinary_pattern, note_content)
+    
+    if not urls:
+        return
+        
+    public_ids = []
+    for url in urls:
+        # Extract public_id from URL
+        # Handle versions v12345/ and also nested folders
+        match = re.search(r'/upload/(?:v\d+/)?(.+?)(?:\.[^.]+)?$', url)
+        if match:
+            public_ids.append(match.group(1))
+            
+    if not public_ids:
+        return
+        
+    # Remove duplicates
+    public_ids = list(set(public_ids))
+        
+    try:
+        auth_string = f"{creds['cloudinary_api_key']}:{creds['cloudinary_api_secret']}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                "DELETE",
+                f"https://api.cloudinary.com/v1_1/{creds['cloudinary_cloud_name']}/resources/image/upload",
+                headers={"Authorization": f"Basic {encoded_auth}"},
+                json={"public_ids": public_ids}
+            )
+            if response.status_code == 200:
+                logger.info(f"🗑️ Successfully cleaned up {len(public_ids)} images from Cloudinary")
+            else:
+                logger.warning(f"⚠️ Cloudinary cleanup returned status {response.status_code}: {response.text}")
+    except Exception as e:
+        logger.error(f"Error cleaning up Cloudinary images: {e}")
 
 @app.get("/api/stats")
 async def get_statistics():
@@ -1244,6 +1297,7 @@ async def update_folder(folder_id: str, folder: FolderUpdate, current_user: User
 @app.delete("/api/folders/{folder_id}")
 async def delete_folder(
     folder_id: str, 
+    background_tasks: BackgroundTasks,
     move_to_root: bool = True, 
     destination_folder_id: Optional[str] = None,
     current_user: UserInDB = Depends(get_current_active_user)
@@ -1254,6 +1308,10 @@ async def delete_folder(
     existing_folder = await db.folders.find_one({"_id": ObjectId(folder_id)})
     if not existing_folder:
         raise HTTPException(status_code=404, detail="Folder not found")
+    
+    # Fetch user for Cloudinary credentials (needed for cleanup)
+    main_db = get_database()
+    user_data = await main_db.users.find_one({"_id": ObjectId(current_user.id)})
     
     # Check if user can delete (only owner)
     if not can_edit_folder(existing_folder, current_user.id):
@@ -1289,6 +1347,12 @@ async def delete_folder(
             for child in child_folders:
                 await delete_folder_recursive(str(child["_id"]))
             
+            # Clean up images for all notes in this folder before deleting them
+            notes_in_folder = await db.notes.find({"folder_id": fid}).to_list(1000)
+            for note in notes_in_folder:
+                if note.get("content") and user_data:
+                    background_tasks.add_task(cleanup_note_images, note["content"], user_data)
+            
             # Delete all notes in this folder
             await db.notes.delete_many({"folder_id": fid})
             
@@ -1301,6 +1365,7 @@ async def delete_folder(
     
     await db.folders.delete_one({"_id": ObjectId(folder_id)})
     return {"message": "Folder deleted"}
+
 
 @app.post("/api/folders/{folder_id}/share")
 async def share_folder(
@@ -1618,7 +1683,11 @@ async def update_note(note_id: str, note_update: NoteUpdate, current_user: UserI
     raise HTTPException(status_code=404, detail="Note not found")
 
 @app.delete("/api/notes/{note_id}")
-async def delete_note(note_id: str, current_user: UserInDB = Depends(get_current_active_user)):
+async def delete_note(
+    note_id: str, 
+    background_tasks: BackgroundTasks,
+    current_user: UserInDB = Depends(get_current_active_user)
+):
     """Delete a note (only owner can delete)"""
     db = await get_user_data_db(current_user)
     if db is not None:
@@ -1632,16 +1701,24 @@ async def delete_note(note_id: str, current_user: UserInDB = Depends(get_current
             if not can_edit_note(note, current_user.id):
                 raise HTTPException(status_code=403, detail="You don't have permission to delete this note. Only the owner can delete.")
             
+            # Fetch user for Cloudinary credentials
+            main_db = get_database()
+            user_data = await main_db.users.find_one({"_id": ObjectId(current_user.id)})
+            
+            # Trigger background cleanup for images
+            if note.get("content") and user_data:
+                background_tasks.add_task(cleanup_note_images, note["content"], user_data)
+            
             result = await db.notes.delete_one({"_id": ObjectId(note_id)})
             if result.deleted_count:
                 # Decrement user's note count in MAIN database
-                main_db = get_database()
                 if main_db is not None:
                     await main_db.users.update_one(
                         {"_id": ObjectId(current_user.id)},
                         {"$inc": {"notes_count": -1}}
                     )
                 return {"message": "Note deleted successfully"}
+
         except HTTPException:
             raise
         except Exception as e:
@@ -2218,11 +2295,59 @@ Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
                 "content": f"Current note content:\n\n{request.current_content}"
             })
         
-        # Add user message
+        # Add context about user's existing structure
+        folders_data = await db.folders.find({"user_id": current_user.id}).to_list(length=100)
+        notes_data = await db.notes.find({"user_id": current_user.id}, {"title": 1, "folder_id": 1}).to_list(length=200)
+        
+        # Build structure summary (Hierarchical)
+        def build_tree_text(parent_id=None, level=0):
+            text = ""
+            indent = "  " * level
+            
+            # Add folders at this level
+            level_folders = [f for f in folders_data if f.get("parent_id") == parent_id]
+            for f in level_folders:
+                text += f"{indent}📂 Folder: {f.get('name')}\n"
+                # Add notes in this folder
+                folder_notes = [n for n in notes_data if str(n.get("folder_id")) == str(f.get("_id"))]
+                for n in folder_notes:
+                    text += f"{indent}  📄 Note: {n.get('title')}\n"
+                # Recursively add subfolders
+                text += build_tree_text(str(f.get("_id")), level + 1)
+            
+            # Root level special case: Add root notes
+            if parent_id is None:
+                root_notes = [n for n in notes_data if not n.get("folder_id")]
+                for n in root_notes:
+                    text += f"📄 Note: {n.get('title')}\n"
+            
+            return text
+
+        structure_text = build_tree_text()
+        structure_summary = "CRITICAL_CONTEXT: CURRENT_STRUCTURE\n" + (structure_text if structure_text.strip() else "(No folders or notes exist yet)\n")
+
         messages.append({
-            "role": "user",
-            "content": request.message
+            "role": "system",
+            "content": structure_summary
         })
+
+        # Add chat history if provided
+        if request.messages:
+            for msg in request.messages:
+                # Filter out messages that might have been processed/filtered on frontend
+                # and ensure we only send role/content
+                if "role" in msg and "content" in msg:
+                    messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+        else:
+            # If no history provided, just add the current user message
+            messages.append({
+                "role": "user",
+                "content": request.message
+            })
+
         
         logger.info(f"  User Message: {request.message}")
         logger.info(f"  Total Messages: {len(messages)}")
@@ -2504,7 +2629,53 @@ Explain the cause
 Show the fix
 Provide backend + frontend code
 Provide URLs to configure
-Use concise step-by-step format"""
+Use concise step-by-step format
+
+✅ 10. File Management (Advanced) - REQUIRES CONFIRMATION
+You can manage the user's notes and folders by including these commands at the VERY END of your response.
+COMMAND:CREATE_NOTE:{"title": "Note Title", "content": "Markdown Content", "folder_name": "Folder Name"}
+COMMAND:CREATE_FOLDER:{"name": "Folder Name", "parent_name": "Parent Folder Name"}
+COMMAND:DELETE_NOTE:{"title": "Note Title"}
+COMMAND:DELETE_FOLDER:{"name": "Folder Name"}
+COMMAND:UPDATE_NOTE:{"old_title": "Old Title", "new_title": "New Title", "new_folder": "New Folder Name"}
+COMMAND:UPDATE_FOLDER:{"old_name": "Old Name", "new_name": "New Name", "new_parent": "New Parent Name"}
+
+STRICT FLOW & EXAMPLES:
+1. Deletion Request:
+   User: "Delete the 'Work' folder" 
+   Assistant: "I will delete the folder 'Work'. Do you want to delete all notes inside it as well, or move them to the root?
+   
+   **Current Structure for Reference:**
+   - Folder: Work
+     - Note: Draft
+   - Folder: Archive
+   
+   Shall I proceed?" 
+   User: "Delete everything"
+   Assistant: "CRT: Folder Deleted. I have removed 'Work' and all its contents.\nCOMMAND:DELETE_FOLDER:{\"name\": \"Work\", \"delete_contents\": true}"
+
+2. Creation Request:
+   User: "Create a note 'TODO' in folder 'Daily'"
+   Assistant: "I will create a note named 'TODO' inside the 'Daily' folder.
+   
+   **Current Structure for Reference:**
+   - Folder: Daily
+   - Note: Shopping
+   
+   Shall I proceed?"
+   User: "Yes"
+   Assistant: "CRT: Note Created. I've added 'TODO' to 'Daily'.\nCOMMAND:CREATE_NOTE:{\"title\": \"TODO\", \"content\": \"\", \"folder_name\": \"Daily\"}"
+
+Important:
+- **CRITICAL**: The `COMMAND:` line MUST be included in your response **AFTER** the user confirms. If you omit it, the action will NOT be performed.
+- **FORMAT**: Each command must be on its own line. **NEVER** wrap the command in markdown like `code blocks` or **bolding**. It must be plain text.
+- **TITLES**: Note titles can be numeric (like "36"). Always treat them as strings in the JSON.
+- **CRT**: Your final response (after confirmation) MUST start with: "CRT: [Item Name] [Action]" followed by a brief confirmation.
+- Use the exact titles/names provided in the "CRITICAL_CONTEXT: CURRENT_STRUCTURE" sections.
+- ALWAYS display the current folder/note hierarchy in your confirmation request.
+- For DELETE_FOLDER, the command is: COMMAND:DELETE_FOLDER:{"name": "Name", "delete_contents": true/false}
+- If delete_contents is false, notes will be moved to the root.
+- Never use raw HTML tags like <p>, <ul>, etc. in content."""
 
 @app.get("/api/settings", response_model=LLMSettingsInDB)
 async def get_llm_settings(current_user: UserInDB = Depends(get_current_active_user)):
