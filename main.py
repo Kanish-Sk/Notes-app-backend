@@ -2382,7 +2382,7 @@ Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
                 "model": model,
                 "messages": user_messages,
                 "system": system_content,
-                "max_tokens": 4096
+                "max_tokens": 2000
             }
         elif provider_type == "gemini":
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -2429,7 +2429,7 @@ Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
                 "model": model,
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 4096  # Limit to prevent credit issues
+                "max_tokens": 2000  # Reduced to prevent credit issues
             }
 
         # Make API call
@@ -2449,7 +2449,24 @@ Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
             if response.status_code != 200:
                 error_detail = response.text
                 logger.error(f"❌ LLM API Error ({provider_type}): {response.status_code} - {error_detail}")
-                raise HTTPException(status_code=response.status_code, detail=f"LLM API error: {error_detail}")
+                
+                # Parse error for user-friendly message
+                user_message = "AI service error. Please try again."
+                try:
+                    error_json = response.json()
+                    if "error" in error_json and isinstance(error_json["error"], dict):
+                        if "message" in error_json["error"]:
+                            error_msg = error_json["error"]["message"]
+                            if response.status_code == 402 or "credits" in error_msg.lower():
+                                user_message = "⚠️ Insufficient credits. Please add credits to your AI provider or switch providers in Settings."
+                            elif "rate limit" in error_msg.lower():
+                                user_message = "⚠️ Rate limit exceeded. Please wait and try again."
+                            else:
+                                user_message = f"⚠️ {error_msg[:150]}"
+                except:
+                    pass
+                
+                raise HTTPException(status_code=response.status_code, detail=user_message)
             
             result = response.json()
             logger.info(f"  📄 Response Keys: {list(result.keys())}")
@@ -2484,6 +2501,274 @@ Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
             message=f"Sorry, I encountered an error: {str(e)}. Please try again.",
             updated_content=None
         )
+
+
+@app.post("/api/ai/chat/stream")
+async def ai_chat_stream(request: AIRequest, current_user: UserInDB = Depends(get_current_active_user)):
+    """Streaming AI assistant endpoint using Server-Sent Events (SSE)"""
+    import os
+    
+    # Use user's data database
+    db = await get_user_data_db(current_user)
+    if db is None:
+        async def error_stream():
+            yield f"data: {json.dumps({'error': 'Database not available'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Get user's LLM settings
+    settings_doc = await db.llm_settings.find_one({"user_id": current_user.id})
+    
+    if not settings_doc or "providers" not in settings_doc or not settings_doc["providers"]:
+        async def error_stream():
+            yield f"data: {json.dumps({'error': 'AI assistant is not configured. Please add an LLM provider in Settings.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Get active providers
+    providers = settings_doc.get("providers", [])
+    active_providers = [p for p in providers if p.get("is_active")]
+    
+    if not active_providers and providers:
+        active_providers = [providers[0]]
+    
+    if not active_providers:
+        async def error_stream():
+            yield f"data: {json.dumps({'error': 'No active LLM providers found.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Select provider
+    default_model = settings_doc.get("default_model")
+    selected_provider = None
+    if default_model:
+        selected_provider = next((p for p in active_providers if p.get("name") == default_model), None)
+    if not selected_provider:
+        selected_provider = active_providers[0]
+    
+    api_key = selected_provider.get("api_key")
+    provider_type = selected_provider.get("provider", "openrouter")
+    model = selected_provider.get("model")
+    
+    if not model or not api_key:
+        async def error_stream():
+            yield f"data: {json.dumps({'error': 'Model or API key not configured.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Build system prompt
+    use_global = selected_provider.get("use_global_prompt", False)
+    provider_system_prompt = (selected_provider.get("system_prompt") or "").strip()
+    global_system_prompt = (settings_doc.get("system_prompt") or "").strip()
+    
+    if request.edit_mode:
+        system_prompt = """You are a helpful AI assistant that edits note documents.
+
+IMPORTANT: Your response will REPLACE the entire note content. You MUST return the complete, updated note including:
+- All existing content that should be kept
+- Your edits/changes applied
+- Proper markdown formatting
+
+User requests may ask you to:
+- Improve/rewrite specific sections
+- Fix grammar and spelling throughout
+- Add or remove content
+- Reorganize or restructure
+- Change tone or style
+
+ALWAYS return the FULL note content with your modifications applied, not just the changed parts.
+Use proper markdown formatting (headings, lists, bold, italic, etc.)."""
+    else:
+        system_prompt = DEFAULT_SYSTEM_PROMPT
+    
+    if use_global and global_system_prompt:
+        system_prompt = global_system_prompt
+    elif provider_system_prompt:
+        system_prompt = provider_system_prompt
+    
+    # Prepare messages
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    if request.current_content:
+        messages.append({
+            "role": "system",
+            "content": f"Current note content:\n\n{request.current_content}"
+        })
+    
+    # Add folder structure context
+    folders_data = await db.folders.find({"user_id": current_user.id}).to_list(length=100)
+    notes_data = await db.notes.find({"user_id": current_user.id}, {"title": 1, "folder_id": 1}).to_list(length=200)
+    
+    def build_tree_text(parent_id=None, level=0):
+        text = ""
+        indent = "  " * level
+        level_folders = [f for f in folders_data if f.get("parent_id") == parent_id]
+        for f in level_folders:
+            text += f"{indent}📂 Folder: {f.get('name')}\n"
+            folder_notes = [n for n in notes_data if str(n.get("folder_id")) == str(f.get("_id"))]
+            for n in folder_notes:
+                text += f"{indent}  📄 Note: {n.get('title')}\n"
+            text += build_tree_text(str(f.get("_id")), level + 1)
+        if parent_id is None:
+            root_notes = [n for n in notes_data if not n.get("folder_id")]
+            for n in root_notes:
+                text += f"📄 Note: {n.get('title')}\n"
+        return text
+
+    structure_text = build_tree_text()
+    structure_summary = "CRITICAL_CONTEXT: CURRENT_STRUCTURE\n" + (structure_text if structure_text.strip() else "(No folders or notes exist yet)\n")
+    messages.append({"role": "system", "content": structure_summary})
+    
+    # Add chat history
+    if request.messages:
+        for msg in request.messages:
+            if "role" in msg and "content" in msg:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+    else:
+        messages.append({"role": "user", "content": request.message})
+    
+    async def stream_response():
+        try:
+            async with httpx.AsyncClient() as client:
+                if provider_type == "openai":
+                    url = "https://api.openai.com/v1/chat/completions"
+                    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                    payload = {"model": model, "messages": messages, "temperature": 0.7, "stream": True}
+                    
+                    async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    yield "data: [DONE]\n\n"
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
+                                        content = chunk["choices"][0]["delta"]["content"]
+                                        yield f"data: {json.dumps({'content': content})}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+                
+                elif provider_type == "anthropic":
+                    url = "https://api.anthropic.com/v1/messages"
+                    headers = {
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json"
+                    }
+                    system_content = "\n\n".join([m["content"] for m in messages if m["role"] == "system"])
+                    user_messages = [m for m in messages if m["role"] != "system"]
+                    payload = {
+                        "model": model,
+                        "messages": user_messages,
+                        "system": system_content,
+                        "max_tokens": 2000,
+                        "stream": True
+                    }
+                    
+                    async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                try:
+                                    chunk = json.loads(data)
+                                    if chunk.get("type") == "content_block_delta":
+                                        content = chunk.get("delta", {}).get("text", "")
+                                        if content:
+                                            yield f"data: {json.dumps({'content': content})}\n\n"
+                                    elif chunk.get("type") == "message_stop":
+                                        yield "data: [DONE]\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+                
+                elif provider_type == "gemini":
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+                    headers = {"Content-Type": "application/json"}
+                    gemini_contents = []
+                    system_instruction = None
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            system_instruction = {"parts": [{"text": msg["content"]}]}
+                        else:
+                            role = "user" if msg["role"] == "user" else "model"
+                            gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+                    payload = {"contents": gemini_contents, "generationConfig": {"temperature": 0.7}}
+                    if system_instruction:
+                        payload["systemInstruction"] = system_instruction
+                    
+                    async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                try:
+                                    chunk = json.loads(data)
+                                    if chunk.get("candidates"):
+                                        parts = chunk["candidates"][0].get("content", {}).get("parts", [])
+                                        for part in parts:
+                                            if part.get("text"):
+                                                yield f"data: {json.dumps({'content': part['text']})}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+                    yield "data: [DONE]\n\n"
+                
+                elif provider_type == "ollama":
+                    url = f"{api_key}/api/chat"
+                    headers = {"Content-Type": "application/json"}
+                    payload = {"model": model, "messages": messages, "stream": True}
+                    
+                    async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                try:
+                                    chunk = json.loads(line)
+                                    if chunk.get("message", {}).get("content"):
+                                        content = chunk["message"]["content"]
+                                        yield f"data: {json.dumps({'content': content})}\n\n"
+                                    if chunk.get("done"):
+                                        yield "data: [DONE]\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+                
+                else:  # OpenRouter
+                    url = "https://openrouter.ai/api/v1/chat/completions"
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://mindflow.ai",
+                        "X-Title": "MindFlow AI"
+                    }
+                    payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 2000, "stream": True}
+                    
+                    async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    yield "data: [DONE]\n\n"
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
+                                        content = chunk["choices"][0]["delta"]["content"]
+                                        yield f"data: {json.dumps({'content': content})}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+        
+        except Exception as e:
+            logger.error(f"Streaming error: {str(e)}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+    
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 # ==================== Chat History Routes ====================
 
@@ -2652,7 +2937,7 @@ STRICT FLOW & EXAMPLES:
    
    Shall I proceed?" 
    User: "Delete everything"
-   Assistant: "CRT: Folder Deleted. I have removed 'Work' and all its contents.\nCOMMAND:DELETE_FOLDER:{\"name\": \"Work\", \"delete_contents\": true}"
+   Assistant: "✅ Done! I've deleted the 'Work' folder and all its contents.\nCOMMAND:DELETE_FOLDER:{\"name\": \"Work\", \"delete_contents\": true}"
 
 2. Creation Request:
    User: "Create a note 'TODO' in folder 'Daily'"
@@ -2664,18 +2949,25 @@ STRICT FLOW & EXAMPLES:
    
    Shall I proceed?"
    User: "Yes"
-   Assistant: "CRT: Note Created. I've added 'TODO' to 'Daily'.\nCOMMAND:CREATE_NOTE:{\"title\": \"TODO\", \"content\": \"\", \"folder_name\": \"Daily\"}"
+   Assistant: "✅ Done! I've created the note 'TODO' in your Daily folder.\nCOMMAND:CREATE_NOTE:{\"title\": \"TODO\", \"content\": \"\", \"folder_name\": \"Daily\"}"
 
 Important:
 - **CRITICAL**: The `COMMAND:` line MUST be included in your response **AFTER** the user confirms. If you omit it, the action will NOT be performed.
+- **MANDATORY**: After showing a friendly confirmation like "✅ Done!", you MUST add the COMMAND line on the next line.
 - **FORMAT**: Each command must be on its own line. **NEVER** wrap the command in markdown like `code blocks` or **bolding**. It must be plain text.
+- **EXAMPLE FORMAT**:
+  ```
+  ✅ Done! I've deleted the 'THINGS' folder.
+  COMMAND:DELETE_FOLDER:{"name": "THINGS", "delete_contents": true}
+  ```
 - **TITLES**: Note titles can be numeric (like "36"). Always treat them as strings in the JSON.
-- **CRT**: Your final response (after confirmation) MUST start with: "CRT: [Item Name] [Action]" followed by a brief confirmation.
+- **FRIENDLY**: After user confirms, start with "✅ Done!" or "✅ Perfect!" followed by a natural description.
 - Use the exact titles/names provided in the "CRITICAL_CONTEXT: CURRENT_STRUCTURE" sections.
 - ALWAYS display the current folder/note hierarchy in your confirmation request.
 - For DELETE_FOLDER, the command is: COMMAND:DELETE_FOLDER:{"name": "Name", "delete_contents": true/false}
 - If delete_contents is false, notes will be moved to the root.
-- Never use raw HTML tags like <p>, <ul>, etc. in content."""
+- Never use raw HTML tags like <p>, <ul>, etc. in content.
+- **REMEMBER**: No COMMAND line = No action will happen. ALWAYS include it after confirmation!"""
 
 @app.get("/api/settings", response_model=LLMSettingsInDB)
 async def get_llm_settings(current_user: UserInDB = Depends(get_current_active_user)):
