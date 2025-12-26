@@ -1051,6 +1051,13 @@ async def get_note(note_id: str, current_user: UserInDB = Depends(get_current_ac
 @app.post("/api/folders", response_model=FolderInDB)
 async def create_folder(folder: FolderCreate, current_user: UserInDB = Depends(get_current_active_user)):
     """Create a new folder - inherits shares from parent if applicable"""
+    # Check if user has their own database configured
+    if not current_user.has_database:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You need to configure your own MongoDB database to create folders. Please go to Settings and add your MongoDB connection string."
+        )
+    
     db = await get_user_data_db(current_user)
     main_db = get_database()
     
@@ -1531,6 +1538,13 @@ async def share_folder(
 @app.post("/api/notes", response_model=NoteInDB, status_code=status.HTTP_201_CREATED)
 async def create_note(note: NoteCreate, current_user: UserInDB = Depends(get_current_active_user)):
     """Create a new note - inherits shares from folder if applicable"""
+    # Check if user has their own database configured
+    if not current_user.has_database:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You need to configure your own MongoDB database to create notes. Please go to Settings and add your MongoDB connection string."
+        )
+    
     # Use user's personal DB if configured, otherwise use main DB
     db = await get_user_data_db(current_user)
     main_db = get_database()
