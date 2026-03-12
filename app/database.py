@@ -1,46 +1,39 @@
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.server_api import ServerApi
+import asyncpg
 import os
 from dotenv import load_dotenv
 from .logger import get_logger
 
 load_dotenv()
 
-# Setup logger
 logger = get_logger(__name__)
 
-# MongoDB connection
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "notion_app")
+NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 
-client = None
-database = None
+pool: asyncpg.Pool | None = None
 
-async def connect_to_mongo():
-    """Connect to MongoDB"""
-    global client, database
+
+async def connect_to_db():
+    global pool
     try:
-        client = AsyncIOMotorClient(MONGODB_URL, server_api=ServerApi('1'))
-        database = client[DATABASE_NAME]
-        # Test connection
-        await client.admin.command('ping')
-        logger.info("✅ Successfully connected to MongoDB!")
+        pool = await asyncpg.create_pool(
+            NEON_DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            command_timeout=60,
+            statement_cache_size=0,
+        )
+        logger.info("✅ Connected to Neon (PostgreSQL)")
     except Exception as e:
-        logger.error(f"❌ Error connecting to MongoDB: {e}")
-        # Use in-memory fallback for development
-        logger.warning("⚠️  Using in-memory storage as fallback")
+        logger.error(f"❌ Failed to connect to Neon: {e}")
+        raise
 
-async def close_mongo_connection():
-    """Close MongoDB connection"""
-    global client
-    if client:
-        client.close()
-        logger.info("Closed MongoDB connection")
 
-def get_database():
-    """Get database instance"""
-    return database
+async def close_db():
+    global pool
+    if pool:
+        await pool.close()
+        logger.info("Closed Neon connection pool")
 
-def get_client():
-    """Get MongoDB client instance for cross-database queries"""
-    return client
+
+def get_pool() -> asyncpg.Pool:
+    return pool
